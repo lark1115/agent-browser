@@ -8,7 +8,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
 use super::auth;
-use super::browser::{BrowserManager, WaitUntil};
+use super::browser::{BrowserManager, ConnectionMode, ExtensionRelayConnectOptions, WaitUntil};
 use super::cdp::chrome::LaunchOptions;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -137,6 +137,15 @@ pub struct DaemonState {
 
 impl DaemonState {
     pub fn new() -> Self {
+        let session_name = env::var("AGENT_BROWSER_SESSION_NAME")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let session_id =
+            env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
+        Self::new_for_session(session_id, session_name)
+    }
+
+    pub fn new_for_session(session_id: String, session_name: Option<String>) -> Self {
         Self {
             browser: None,
             appium: None,
@@ -149,8 +158,8 @@ impl DaemonState {
                 .filter(|s| !s.is_empty())
                 .map(|s| DomainFilter::new(&s)),
             event_tracker: EventTracker::new(),
-            session_name: env::var("AGENT_BROWSER_SESSION_NAME").ok(),
-            session_id: env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
+            session_name,
+            session_id,
             tracing_state: TracingState::new(),
             recording_state: RecordingState::new(),
             event_rx: None,
@@ -173,13 +182,24 @@ impl DaemonState {
     /// Create state with an optional stream client slot and server instance
     /// (for daemon startup with stream server).
     pub fn new_with_stream(
+        session_id: String,
+        session_name: Option<String>,
         stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
         stream_server: Option<Arc<StreamServer>>,
     ) -> Self {
-        let mut s = Self::new();
+        let mut s = Self::new_for_session(session_id, session_name);
         s.stream_client = stream_client;
         s.stream_server = stream_server;
         s
+    }
+
+    pub async fn flush_tab_assignments(&mut self) -> Result<(), String> {
+        if let Some(browser) = self.browser.as_mut() {
+            browser
+                .flush_tab_assignments_if_active("attached", None)
+                .await?;
+        }
+        Ok(())
     }
 
     fn subscribe_to_browser_events(&mut self) {
@@ -579,7 +599,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     for target_id in &destroyed_targets {
         if let Some(ref mut mgr) = state.browser {
-            mgr.remove_page_by_target_id(target_id);
+            let _ = mgr.remove_page_by_target_id(target_id).await;
         }
     }
 
@@ -609,13 +629,17 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     .await;
                 }
 
-                mgr.add_page(super::browser::PageInfo {
-                    target_id: te.target_info.target_id.clone(),
-                    session_id: attach.session_id,
-                    url: te.target_info.url.clone(),
-                    title: te.target_info.title.clone(),
-                    target_type: te.target_info.target_type.clone(),
-                });
+                let _ = mgr
+                    .add_page(super::browser::PageInfo {
+                        target_id: te.target_info.target_id.clone(),
+                        session_id: attach.session_id,
+                        url: te.target_info.url.clone(),
+                        title: te.target_info.title.clone(),
+                        target_type: te.target_info.target_type.clone(),
+                        browser_context_id: te.target_info.browser_context_id.clone(),
+                        assigned_tab: super::browser::AssignedTabMetadata::default(),
+                    })
+                    .await;
             }
         }
     }
@@ -916,10 +940,46 @@ async fn connect_auto_with_fresh_tab() -> Result<BrowserManager, String> {
 async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
     let options = launch_options_from_env();
     let engine = env::var("AGENT_BROWSER_ENGINE").ok();
+    let env_connection_mode = env::var("AGENT_BROWSER_CONNECTION_MODE").ok();
+    let connection_mode = ConnectionMode::resolve(
+        env_connection_mode.as_deref(),
+        env::var("AGENT_BROWSER_CDP").is_ok(),
+        env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok(),
+        env::var("AGENT_BROWSER_RELAY_URL").is_ok(),
+        false,
+    )?;
+
+    if matches!(connection_mode, ConnectionMode::ExtensionRelay) {
+        let relay_url = env::var("AGENT_BROWSER_RELAY_URL").map_err(|_| {
+            "AGENT_BROWSER_RELAY_URL is required for connectionMode=extension-relay".to_string()
+        })?;
+        let profile_id = env::var("AGENT_BROWSER_PROFILE_ID").ok();
+        let profile_directory = env::var("AGENT_BROWSER_PROFILE_DIRECTORY").ok();
+        let agent_id = env::var("AGENT_BROWSER_AGENT_ID").ok();
+        let mgr = BrowserManager::connect_via_extension_relay(ExtensionRelayConnectOptions {
+            relay_url: &relay_url,
+            session_id: &state.session_id,
+            session_name: state.session_name.as_deref(),
+            profile_id: profile_id.as_deref(),
+            profile_directory: profile_directory.as_deref(),
+            persist_tab_assignment: env::var("AGENT_BROWSER_PERSIST_TAB_ASSIGNMENT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            agent_id: agent_id.as_deref(),
+        })
+        .await?;
+        state.browser = Some(mgr);
+        configure_browser_tab_assignment_persistence(state).await?;
+        state.subscribe_to_browser_events();
+        state.update_stream_client().await;
+        try_auto_restore_state(state).await;
+        return Ok(());
+    }
 
     if let Ok(cdp) = env::var("AGENT_BROWSER_CDP") {
         let mgr = BrowserManager::connect_cdp(&cdp).await?;
         state.browser = Some(mgr);
+        configure_browser_tab_assignment_persistence(state).await?;
         state.subscribe_to_browser_events();
         state.update_stream_client().await;
         try_auto_restore_state(state).await;
@@ -928,6 +988,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
 
     if env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok() {
         state.browser = Some(connect_auto_with_fresh_tab().await?);
+        configure_browser_tab_assignment_persistence(state).await?;
         state.subscribe_to_browser_events();
         state.update_stream_client().await;
         try_auto_restore_state(state).await;
@@ -936,10 +997,26 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
 
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.browser = Some(mgr);
+    configure_browser_tab_assignment_persistence(state).await?;
     state.subscribe_to_browser_events();
     state.update_stream_client().await;
     try_auto_restore_state(state).await;
     Ok(())
+}
+
+async fn configure_browser_tab_assignment_persistence(
+    state: &mut DaemonState,
+) -> Result<(), String> {
+    let Some(session_name) = state.session_name.clone() else {
+        return Ok(());
+    };
+    let Some(browser) = state.browser.as_mut() else {
+        return Ok(());
+    };
+
+    browser
+        .configure_tab_assignment_persistence(state.session_id.clone(), session_name)
+        .await
 }
 
 fn launch_options_from_env() -> LaunchOptions {
@@ -1027,12 +1104,25 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .get("autoConnect")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let env_connection_mode = env::var("AGENT_BROWSER_CONNECTION_MODE").ok();
+    let relay_url = cmd
+        .get("relayUrl")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| env::var("AGENT_BROWSER_RELAY_URL").ok());
+    let connection_mode = ConnectionMode::resolve(
+        cmd.get("connectionMode")
+            .and_then(|v| v.as_str())
+            .or(env_connection_mode.as_deref()),
+        cdp_url.is_some() || cdp_port.is_some(),
+        auto_connect,
+        relay_url.is_some(),
+        cmd.get("provider").and_then(|v| v.as_str()).is_some(),
+    )?;
 
     // Relaunch logic: check if we can reuse the existing connection
     let needs_relaunch = if let Some(ref mgr) = state.browser {
-        let is_external = cdp_url.is_some() || cdp_port.is_some() || auto_connect;
-        let was_external = mgr.is_cdp_connection();
-        is_external != was_external || !mgr.is_connection_alive().await
+        mgr.connection_mode() != connection_mode || !mgr.is_connection_alive().await
     } else {
         true
     };
@@ -1066,18 +1156,58 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .map(String::from)
         .or_else(|| std::env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok());
 
-    let has_cdp = cdp_url.is_some() || cdp_port.is_some();
     super::browser::validate_launch_options(
         extensions.as_deref(),
-        has_cdp,
+        connection_mode,
         profile,
         storage_state,
         allow_file_access,
         executable_path.as_deref(),
     )?;
 
+    if matches!(connection_mode, ConnectionMode::ExtensionRelay) {
+        let relay_url = relay_url
+            .ok_or_else(|| "relayUrl is required for connectionMode=extension-relay".to_string())?;
+        let env_profile_id = env::var("AGENT_BROWSER_PROFILE_ID").ok();
+        let env_profile_directory = env::var("AGENT_BROWSER_PROFILE_DIRECTORY").ok();
+        let env_agent_id = env::var("AGENT_BROWSER_AGENT_ID").ok();
+        state.browser = Some(
+            BrowserManager::connect_via_extension_relay(ExtensionRelayConnectOptions {
+                relay_url: &relay_url,
+                session_id: &state.session_id,
+                session_name: state.session_name.as_deref(),
+                profile_id: cmd
+                    .get("profileId")
+                    .and_then(|v| v.as_str())
+                    .or(env_profile_id.as_deref()),
+                profile_directory: cmd
+                    .get("profileDirectory")
+                    .and_then(|v| v.as_str())
+                    .or(env_profile_directory.as_deref()),
+                persist_tab_assignment: cmd
+                    .get("persistTabAssignment")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or_else(|| {
+                        env::var("AGENT_BROWSER_PERSIST_TAB_ASSIGNMENT")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false)
+                    }),
+                agent_id: cmd
+                    .get("agentId")
+                    .and_then(|v| v.as_str())
+                    .or(env_agent_id.as_deref()),
+            })
+            .await?,
+        );
+        configure_browser_tab_assignment_persistence(state).await?;
+        state.subscribe_to_browser_events();
+        state.update_stream_client().await;
+        return Ok(json!({ "launched": true }));
+    }
+
     if let Some(url) = cdp_url {
         state.browser = Some(BrowserManager::connect_cdp(url).await?);
+        configure_browser_tab_assignment_persistence(state).await?;
         state.subscribe_to_browser_events();
         state.update_stream_client().await;
         return Ok(json!({ "launched": true }));
@@ -1085,6 +1215,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     if let Some(port) = cdp_port {
         state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
+        configure_browser_tab_assignment_persistence(state).await?;
         state.subscribe_to_browser_events();
         state.update_stream_client().await;
         return Ok(json!({ "launched": true }));
@@ -1092,6 +1223,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     if auto_connect {
         state.browser = Some(connect_auto_with_fresh_tab().await?);
+        configure_browser_tab_assignment_persistence(state).await?;
         state.subscribe_to_browser_events();
         state.update_stream_client().await;
         return Ok(json!({ "launched": true }));
@@ -1110,6 +1242,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                 match BrowserManager::connect_cdp(&ws_url).await {
                     Ok(mgr) => {
                         state.browser = Some(mgr);
+                        configure_browser_tab_assignment_persistence(state).await?;
                         state.subscribe_to_browser_events();
                         state.update_stream_client().await;
                         return Ok(json!({ "launched": true, "provider": provider }));
@@ -1196,6 +1329,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     }
 
     state.browser = Some(BrowserManager::launch(options, engine.as_deref()).await?);
+    configure_browser_tab_assignment_persistence(state).await?;
     state.subscribe_to_browser_events();
     state.update_stream_client().await;
 
@@ -2826,7 +2960,10 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
             url: nav_url.clone(),
             title: String::new(),
             target_type: "page".to_string(),
-        });
+            browser_context_id: None,
+            assigned_tab: super::browser::AssignedTabMetadata::default(),
+        })
+        .await?;
 
         // Navigate to URL
         if nav_url != "about:blank" {
@@ -4476,7 +4613,10 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
         url: "about:blank".to_string(),
         title: String::new(),
         target_type: "page".to_string(),
-    });
+        browser_context_id: None,
+        assigned_tab: super::browser::AssignedTabMetadata::default(),
+    })
+    .await?;
 
     if let Some(viewport) = cmd.get("viewport") {
         let width = viewport
